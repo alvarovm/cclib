@@ -52,6 +52,9 @@ class Psi4(logfileparser.Logfile):
             r"^\s*(Mulliken|Lowdin|MBIS) Charges(:?: \(a\.u\.\)| \[a\.u\.\]:)"
         )
 
+        self.ccsd_trigger = "* CCSD total energy"
+        self.ccsd_t_trigger = "* CCSD(T) total energy"
+
     def after_parsing(self):
         super(Psi4, self).after_parsing()
 
@@ -692,14 +695,16 @@ class Psi4(logfileparser.Logfile):
                 self.mpenergies = []
             self.mpenergies.append([mpenergy])
 
-        # Note this is just a start and needs to be modified for CCSD(T), etc.
-        ccsd_trigger = "* CCSD total energy"
-        if line.strip()[:len(ccsd_trigger)] == ccsd_trigger:
+        if line.lstrip().startswith(self.ccsd_trigger):
             self.metadata["methods"].append("CCSD")
             ccsd_energy = utils.convertor(float(line.split()[-1]), 'hartree', 'eV')
-            if not hasattr(self, "ccenergis"):
-                self.ccenergies = []
-            self.ccenergies.append(ccsd_energy)
+            self.append_attribute("ccenergies", ccsd_energy)
+
+        if line.strip().startswith(self.ccsd_t_trigger):
+            assert self.metadata["methods"][-1] == "CCSD"
+            self.metadata["methods"].append("CCSD(T)")
+            ccsd_t_energy = utils.convertor(float(line.split()[-1]), 'hartree', 'eV')
+            self.ccenergies[-1] = ccsd_t_energy
 
         # The geometry convergence targets and values are printed in a table, with the legends
         # describing the convergence annotation. Probably exact slicing of the line needs
@@ -924,11 +929,14 @@ class Psi4(logfileparser.Logfile):
                 for info in Psi4.GRADIENT_TYPES.values()
                 if info.header == line.strip()
             ][0]
-            gradient = self.parse_gradient(inputfile, gradient_skip_lines)
 
-            if not hasattr(self, 'grads'):
-                self.grads = []
-            self.grads.append(gradient)
+            self.append_attribute(
+                "grads",
+                self.parse_gradient(inputfile, gradient_skip_lines)
+            )
+
+        if line.strip() == "## Total Hessian (Symmetry 0) ##":
+            self.set_attribute("hessian", self.parse_hessian(inputfile))
 
         # OLD Normal mode output parser (PSI4 < 1)
 
@@ -1154,6 +1162,27 @@ class Psi4(logfileparser.Logfile):
             line = next(inputfile)
         return gradient
 
+    def parse_hessian(self, inputfile):
+        """Parse the geometric/molecular Hessian."""
+        line = next(inputfile)
+        tokens = line.split()
+        nrows, ncols = int(tokens[3]), int(tokens[5])
+        icol = 0
+        col_counter = ncols
+        n_max_cols = 5
+        hessian = numpy.empty((nrows, ncols))
+        while col_counter > 0:
+            self.skip_lines(inputfile, ["b", "column numbers", "b"])
+            for irow in range(nrows):
+                line = next(inputfile)
+                # 0:5 then 5:6
+                hessian[irow, icol:icol+n_max_cols] = [float(x) for x in line.split()[1:]]
+            if col_counter - n_max_cols < 0:
+                break
+            col_counter -= n_max_cols
+            icol += n_max_cols
+        return hessian
+
     @staticmethod
     def parse_vibration(n, inputfile):
 
@@ -1198,6 +1227,8 @@ class Psi4(logfileparser.Logfile):
         assert 'RMS dev' in line
 
         line = next(inputfile)
+        if 'IR activ' in line:
+            line = next(inputfile)
         assert 'Char temp' in line
 
         line = next(inputfile)

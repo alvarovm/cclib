@@ -257,6 +257,13 @@ class ORCA(logfileparser.Logfile):
                             coords.append(splitter(line))
             self.metadata['keywords'] = keywords
             self.metadata['coords'] = coords
+
+        # Semiempirical methods use a minimal basis fit to Slater functions,
+        # not def2-SVP or whatever default is given before the input file is
+        # echoed.
+        if "FIT TO SLATER BASIS" in line:
+            self.metadata["basis_set"] = line.split()[0][4:]
+
         # If the calculations is a unrelaxed parameter scan then immediately following the 
         # input file block is the following section:
                 
@@ -429,7 +436,18 @@ class ORCA(logfileparser.Logfile):
                 line = next(inputfile)
             energy = utils.convertor(float(line.split()[3]), "hartree", "eV")
             self.scfenergies.append(energy)
-            self.metadata['methods'].append('HF' if not self.is_DFT else 'DFT')
+            if self.is_DFT:
+                method = "DFT"
+            else:
+                semiempirical_methods = _METHODS_SEMIEMPIRICAL & {
+                    keyword.upper() for keyword in self.metadata["keywords"]
+                }
+                assert len(semiempirical_methods) in (0, 1)
+                if semiempirical_methods:
+                    method = semiempirical_methods.pop()
+                else:
+                    method = "HF"
+            self.metadata['methods'].append(method)
 
             self._append_scfvalues_scftargets(inputfile, line)
 
@@ -646,20 +664,26 @@ Dispersion correction           -0.016199959
             self.skip_lines(inputfile, ['d', 'b'])
             line = next(inputfile)
             assert line[:4] == 'E(0)'
-            scfenergy = utils.convertor(utils.float(line.split()[-1]), 'hartree', 'eV')
+            scfenergy = utils.convertor(float(line.split()[-1]), 'hartree', 'eV')
             line = next(inputfile)
             assert line[:7] == 'E(CORR)'
             while 'E(TOT)' not in line:
                 line = next(inputfile)
             self.append_attribute(
                 'ccenergies',
-                utils.convertor(utils.float(line.split()[-1]), 'hartree', 'eV')
+                utils.convertor(float(line.split()[-1]), 'hartree', 'eV')
             )
             self.metadata['methods'].append('CCSD')
             line = next(inputfile)
             assert line[:23] == 'Singles Norm <S|S>**1/2'
             line = next(inputfile)
-            self.metadata["t1_diagnostic"] = utils.float(line.split()[-1])
+            self.metadata["t1_diagnostic"] = float(line.split()[-1])
+
+        # Most of the "TRIPLES CORRECTION" correction block can be ignored.
+        if line[:10] == "E(CCSD(T))":
+            self.ccenergies[-1] = utils.convertor(float(line.split()[-1]), "hartree", "eV")
+            assert self.metadata["methods"][-1] == "CCSD"
+            self.metadata["methods"].append("CCSD(T)")
 
         # ------------------
         # CARTESIAN GRADIENT
@@ -1111,7 +1135,8 @@ Dispersion correction           -0.016199959
             else:
                 self.freeenergy = self.enthalpy - self.temperature * self.entropy
                 
-        if "ORCA TD-DFT/TDA CALCULATION" in line:
+        if any(x in line
+               for x in ("ORCA TD-DFT/TDA CALCULATION", "ORCA CIS CALCULATION")):
             # Start of excited states, reset our attributes in case this is an optimised excited state calc
             # (or another type of calc where excited states are calculated multiple times).
             for attr in ("etenergies", "etsyms", "etoscs", "etsecs", "etrotats"):
@@ -1119,7 +1144,12 @@ Dispersion correction           -0.016199959
                     delattr(self, attr)
 
         # Read TDDFT information
-        if any(x in line for x in ("TD-DFT/TDA EXCITED", "TD-DFT EXCITED")):
+        if any(
+                x in line
+                for x in (
+                        "TD-DFT/TDA EXCITED", "TD-DFT EXCITED", "CIS-EXCITED", "CIS EXCITED"
+                )
+        ):
             # Could be singlets or triplets
             if line.find("SINGLETS") >= 0:
                 mult = "Singlet"
@@ -1483,30 +1513,125 @@ States  Energy Wavelength    D2        m2        Q2         D2+m2+Q2       D2/TO
             while line.strip() != 'CHEMICAL SHIELDING SUMMARY (ppm)':
                 if line[:8] == ' Nucleus':
                     atom = int(re.search(r'Nucleus\s+(\d+)\w', line).groups()[0])
-                    self.skip_lines(inputfile, ['-', ''])
                     atomtensors = dict()
-                    for _ in range(3):
-                        t_type = next(inputfile).split()[0].lower()
-                        tensor = numpy.zeros((3, 3))
-                        for j, row in zip(range(3), inputfile):
-                            tensor[j, :] = list(map(float, row.split()))
-                        atomtensors[t_type] = tensor
-                        self.skip_line(inputfile, '')
+                    
+                    while "Diagonalized sT*s matrix:" not in line:
+                        if "contribution" in line or "Total shielding tensor" in line:
+                            # Tensor section.
+                            t_type = line.split()[0].lower()
+                            
+                            # Read the tensor.
+                            tensor = numpy.zeros((3, 3))
+                            for j, row in zip(range(3), inputfile):
+                                tensor[j] = list(map(float, row.split()))
+                            
+                            atomtensors[t_type] = tensor
+                        
+                        line = next(inputfile)
+                        
+                    while "Total" not in line:
+                        line = next(inputfile)
+                        
+                    atomtensors['isotropic'] = float(line.split()[-1])
                     nmrtensors[atom] = atomtensors
+                
                 line = next(inputfile)
 
-            self.skip_lines(inputfile, ['-', '', '', 'text', '-'])
-
-            # Not currently used.
-            isotropic, anisotropic = [], []
-            for line in inputfile:
-                if not line.strip():
-                    break
-                nucleus, element, iso, aniso = line.split()
-                isotropic.append(float(iso))
-                anisotropic.append(float(aniso))
-
             self.set_attribute('nmrtensors', nmrtensors)
+            
+        # -----------------------------------------------------------
+        #  NUCLEUS A = C    0 NUCLEUS B = C    1 
+        #  ( 13C  gnA =  1.405  13C  gnB =  1.405) r(AB) =     2.8677
+        # -----------------------------------------------------------
+        # 
+        # Diamagnetic contribution (Hz):
+        #         0.4891        -0.1270       -0.0000
+        #        -0.1270        -0.2550        0.0000
+        #        -0.0000         0.0000       -0.1388
+        # Paramagnetic contribution (Hz):
+        #         1.1869         0.2802        0.0000
+        #         0.2802        -0.5515        0.0000
+        #        -0.0000         0.0000       -0.0408
+        # Fermi-contact contribution (Hz):
+        #         7.4196         0.0000        0.0000
+        #         0.0000         7.4196        0.0000
+        #         0.0000         0.0000        7.4196
+        # Spin-dipolar contribution (Hz):
+        #         0.7215         0.0394       -0.0000
+        #         0.0394         1.0985       -0.0000
+        #         0.0000         0.0000        3.6092
+        # Spin-dipolar/Fermi contact cross term contribution (Hz):
+        #         1.9743         0.0164        0.0000
+        #         0.0164         2.2237       -0.0000
+        #         0.0000        -0.0000       -4.1983
+        # 
+        # Total spin-spin coupling tensor  (Hz):
+        #        11.7914         0.2090       -0.0000
+        #         0.2090         9.9353       -0.0000
+        #         0.0000         0.0000        6.6509
+        # 
+        #  Diagonalized sT*s matrix:
+        #  
+        #  ssDSO           -0.139           -0.218            0.452  iso=       0.032
+        #  ssPSO           -0.041           -0.592            1.227  iso=       0.198
+        #  ssFC             7.420            7.420            7.420  iso=       7.420
+        #  ssSD             3.609            1.085            0.735  iso=       1.810
+        #  ssSD/FC         -4.198            2.217            1.981  iso=      -0.000
+        #         ---------------  ---------------  ---------------  ----------------
+        #  Total            6.651            9.912           11.815  iso=       9.459
+        #
+        # Sections for NMR spin-spin couplings.
+        if "NMR SPIN-SPIN COUPLING CONSTANTS" in line:
+            # Reset attributes for upcoming section.
+            setattr(self, "nmrcouplingtensors", dict())
+        
+        if "NUCLEUS A =" in line and "NUCLEUS B =" in line:
+            line_split = line.split()
+            # Here we're relying on whitespace between the element symbol and index.
+            # For two character elements (eg Cu) and big molecules (>1000 atoms) this space may disappear...
+            atoms = (int(line_split[4]), int(line_split[9]))
+            
+            # Even though our atom indices reference back to atomnos/atommasses etc, we also need to record
+            # the NMR isotope (this isn't recorded anywhere else, and multiple isotopes might get printed).
+            line = next(inputfile)
+            line_split = line.split()
+            # We might have similar whitespace problems here.
+            isotopes = (int(re.search(r"\d+", line_split[1])[0]), int(re.search(r"\d+", line_split[5])[0]))
+            
+            # Look for tensor sections.
+            # The order and number of tensors is not guaranteed (because different tensors can be
+            # explicitly requested).
+            tensors = dict()
+            while "Diagonalized sT*s matrix:" not in line:
+                if "contribution" in line or "Total spin-spin coupling tensor" in line:
+                    # Tensor section.
+                    t_type = line.split()[0].lower()
+                    
+                    # Do some name-nudging.
+                    if t_type == "fermi-contact":
+                        t_type = "fermi"
+                    
+                    elif t_type == "spin-dipolar/fermi":
+                        t_type = "spin-dipolar-fermi"
+                    
+                    # Read the tensor.
+                    tensor = numpy.zeros((3, 3))
+                    for j, row in zip(range(3), inputfile):
+                        tensor[j] = list(map(float, row.split()))
+                    
+                    tensors[t_type] = tensor
+                
+                line = next(inputfile)
+            
+            while "Total" not in line:
+                line = next(inputfile)
+                
+            tensors['isotropic'] = float(line.split()[-1])
+            
+            if atoms not in self.nmrcouplingtensors:
+                self.nmrcouplingtensors[atoms] = {}
+                
+            self.nmrcouplingtensors[atoms][isotopes] = tensors
 
         if line[:23] == "VIBRATIONAL FREQUENCIES":
 
@@ -1666,7 +1791,22 @@ States  Energy Wavelength    D2        m2        Q2         D2+m2+Q2       D2/TO
         #   are not printed (there is a blank line at the end).
         if line[:22] == "LOEWDIN ATOMIC CHARGES":
             self.parse_charge_section(line, inputfile, 'lowdin')
-        #CHELPG Charges
+        # ------------------
+        # HIRSHFELD ANALYSIS
+        # ------------------
+        # 
+        # Total integrated alpha density =    142.999988722
+        # Total integrated beta density  =    142.999988722
+        #  
+        #   ATOM     CHARGE      SPIN                 
+        #    0 H    0.157924    0.000000         
+        #    1 O   -0.209542    0.000000         
+        #    2 C    0.030659    0.000000
+        # ...
+        #   TOTAL  -0.999977    0.000000    
+        if line[:18] == "HIRSHFELD ANALYSIS":
+            self.parse_charge_section(line, inputfile, 'hirshfeld')
+        #CHELPG Charges            
         #--------------------------------
         #  0   C   :       0.363939
         #  1   H   :       0.025695
@@ -2039,7 +2179,7 @@ States  Energy Wavelength    D2        m2        Q2         D2+m2+Q2       D2/TO
           handle to file object
         chargestype : str
           what type of charge we're dealing with, must be one of
-          'mulliken', 'lowdin' or 'chelpg'
+          'mulliken', 'lowdin', 'chelpg' or 'hirshfeld'
         """
         has_spins = 'AND SPIN POPULATIONS' in line
 
@@ -2052,20 +2192,34 @@ States  Energy Wavelength    D2        m2        Q2         D2+m2+Q2       D2/TO
 
         # depending on chargestype, decide when to stop parsing lines
         # start, stop - indices for slicing lines and grabbing values
+        # should_stop: when to stop parsing
         if chargestype == 'mulliken':
             should_stop = lambda x: x.startswith('Sum of atomic charges')
             start, stop = 8, 20
         elif chargestype == 'lowdin':
-            # stops when blank line encountered
             should_stop = lambda x: not bool(x.strip())
             start, stop = 8, 20
         elif chargestype == 'chelpg':
             should_stop = lambda x: x.startswith('---')
             start, stop = 11, 26
+        elif chargestype == 'hirshfeld':
+            should_stop = lambda x: not bool(x.strip())
+            start, stop = 9, 17
+            self.skip_lines(
+                inputfile,
+                [
+                    "d",
+                    "b",
+                    "Total integrated alpha density",
+                    "Total integrated beta density",
+                    "header",
+                ]
+            )
+        else:
+            raise RuntimeError(f"unknown chargestype: {chargestype}")
 
         charges = []
-        if has_spins:
-            spins = []
+        spins = []
 
         line = next(inputfile)
         while not should_stop(line):
@@ -2257,3 +2411,12 @@ States  Energy Wavelength    D2        m2        Q2         D2+m2+Q2       D2/TO
                 assert maxDP_target == self.scftargets[-1][1]
             self.scfvalues[-1].append([deltaE_value, maxDP_value, rmsDP_value])
             self.scftargets.append([deltaE_target, maxDP_target, rmsDP_target])
+
+
+_METHODS_SEMIEMPIRICAL = {
+    "AM1",
+    "MNDO",
+    "PM3",
+    "ZINDO/1",
+    "ZINDO/S",
+}

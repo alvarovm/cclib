@@ -764,13 +764,15 @@ def testnoparseGAMESS_WinGAMESS_H2O_def2SVPD_triplet_2019_06_30_R1_out(filename)
     """
     data = ccread(os.path.join(__filedir__,filename))
     writer = moldenwriter.MOLDEN(data)
+    mosyms, moenergies, mooccs, mocoeffs = writer._syms_energies_occs_coeffs_from_ccdata_for_moldenwriter()
+    molden_lines = writer._mo_from_ccdata(mosyms,moenergies,mooccs,mocoeffs)
     # Check size of Atoms section.
-    assert len(writer._mo_from_ccdata()) == (data.nbasis + 4) * (data.nmo * 2)
+    assert len(molden_lines) == (data.nbasis + 4) * (data.nmo * 2)
     # check docc orbital
     beta_idx = (data.nbasis + 4) * data.nmo
-    assert "Beta" in writer._mo_from_ccdata()[beta_idx + 2]
-    assert "Occup=   1.000000" in writer._mo_from_ccdata()[beta_idx + 3]
-    assert "0.989063" in writer._mo_from_ccdata()[beta_idx + 4]
+    assert "Beta" in molden_lines[beta_idx + 2]
+    assert "Occup=   1.000000" in molden_lines[beta_idx + 3]
+    assert "0.989063" in molden_lines[beta_idx + 4]
 
 
 # GAMESS-UK #
@@ -1846,6 +1848,16 @@ def testORCA_ORCA4_2_MP2_gradient_out(logfile):
     # atom 2, y-coordinate.
     idx = (0, 1, 1)
     assert logfile.data.grads[idx] == -0.00040549
+
+
+def testORCA_ORCA4_2_ligando_30_SRM1_S_ZINDO_out(logfile):
+    """ORCA says that ZINDO uses the def2-SVP basis set before echoing the
+    input file despite actually using STO-3G fit to Slater functions (#1187).
+    """
+    assert logfile.data.metadata["basis_set"] == "STO-3G"
+    assert logfile.data.metadata["methods"] == ["ZINDO/S"]
+    assert hasattr(logfile.data, "etsyms")
+
 
 def testORCA_ORCA4_2_long_input_out(logfile):
     """Long ORCA input file (#804)."""
@@ -3208,8 +3220,16 @@ class MolproBigBasisTest_cart(MolproBigBasisTest):
 
 # ORCA #
 
+class OrcaSPTest_nohirshfeld(OrcaSPTest):
+    """Versions pre-5.0 did not specify calculating Hirshfeld atomic charges.
+    """
 
-class OrcaSPTest_nobasis(OrcaSPTest):
+    @unittest.skip("atomcharges['hirshfeld'] were not calculated")
+    def testatomcharges_hirshfeld(test):
+        """Hirshfeld atomic charges were not calculated"""
+
+
+class OrcaSPTest_nobasis(OrcaSPTest_nohirshfeld):
     """Versions pre-4.0 do not concretely print the basis set(s) used aside
     from repeating the input file.
     """
@@ -3536,7 +3556,7 @@ old_unittests = [
     ("ORCA/ORCA4.0/dvb_sp.out", GenericBasisTest),
     ("ORCA/ORCA4.0/dvb_gopt.out", OrcaGeoOptTest),
     ("ORCA/ORCA4.0/Trp_polar.out", ReferencePolarTest),
-    ("ORCA/ORCA4.0/dvb_sp.out", OrcaSPTest),
+    ("ORCA/ORCA4.0/dvb_sp.out", OrcaSPTest_nohirshfeld),
     ("ORCA/ORCA4.0/dvb_sp_un.out", GenericSPunTest),
     ("ORCA/ORCA4.0/dvb_td.out", OrcaTDDFTTest_pre5),
     ("ORCA/ORCA4.0/dvb_rocis.out", OrcaROCIS40Test),
